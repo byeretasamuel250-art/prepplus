@@ -63,7 +63,27 @@ const doAdminLogin = safeRender(async function () {
   renderDashboard();
 });
 
+// ---------- REALTIME: live-refresh so a new "I've paid" tap shows up
+// on the dashboard without the admin needing to press refresh ----------
+let requestsChannel = null;
+function startRequestsRealtime() {
+  if (requestsChannel) return; // already listening
+  requestsChannel = sb
+    .channel("admin-subscription-requests")
+    .on("postgres_changes", { event: "*", schema: "public", table: "subscription_requests" }, async () => {
+      // Refetch just the pending requests + stats. Avoid a full loadAll()
+      // while the admin is mid-typing on the Content or Users tab.
+      const { data: requests } = await sb.from("subscription_requests")
+        .select("*, profiles(name, phone)").eq("status", "pending").order("created_at", { ascending: false });
+      state.requests = requests || [];
+      renderStats();
+      if (state.tab === "requests") renderRequestsTable();
+    })
+    .subscribe();
+}
+
 async function adminLogout() {
+  if (requestsChannel) { await sb.removeChannel(requestsChannel); requestsChannel = null; }
   await sb.auth.signOut();
   state.admin = null;
   renderLogin();
@@ -86,6 +106,7 @@ async function renderDashboard() {
     <div id="tab-content"><div class="center-loading">Loading…</div></div>
   `;
   await loadAll();
+  startRequestsRealtime();
 }
 
 async function loadAll() {
