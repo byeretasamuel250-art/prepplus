@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>prep+</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app"><div class="center-loading">Loading prep+…</div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="config.js"></script>
+<script src="shared.js"></script>
+<script>
+let sb;
+let state = { profile: null, subjects: [], subject: null, topics: [], quiz: null, refreshTimer: null, timerInterval: null };
+const root = () => document.getElementById("app");
+
+window.addEventListener("DOMContentLoaded", () => {
+  try { sb = initSupabase(); } catch (e) { return; }
+  boot();
+});
+
+const boot = safeRender(async function () {
+  const session = await ensureSession(sb);
+  const { data, error } = await sb.from("profiles").select("*").eq("auth_uid", session.user.id).maybeSingle();
+  if (error) throw error;
+  if (!data) return renderWelcome();
+  state.profile = data;
+  renderSubjectList();
+  state.refreshTimer = setInterval(refreshProfile, 15000);
+});
+
+async function refreshProfile() {
+  if (!state.profile) return;
+  const { data } = await sb.from("profiles").select("*").eq("id", state.profile.id).maybeSingle();
+  if (data) state.profile = data;
+}
+
+async function logout() {
+  clearInterval(state.refreshTimer);
+  clearInterval(state.timerInterval);
+  await sb.auth.signOut();
+  state = { profile: null, subjects: [], subject: null, topics: [], quiz: null, refreshTimer: null, timerInterval: null };
+  await ensureSession(sb);
+  renderWelcome();
+}
+
+// ---------- WELCOME ----------
+function renderWelcome() {
+  root().innerHTML = `
+    <div class="brand">prep<span class="plus">+</span></div>
+    <div class="tagline">UCE and UACE past papers, turned into practice.</div>
+    <div class="card">
+      <h1>Study smarter, not just longer</h1>
+      <p>Practice real past-paper questions by topic or by year, see instantly where you're strong, and find out exactly what to revise next.</p>
+      <button class="btn-primary" onclick="renderRegister()">Create an account</button>
+      <button class="btn-secondary" style="margin-top:10px" onclick="renderLogin()">I already have an account</button>
+    </div>
+  `;
+}
+
+// ---------- REGISTER ----------
+function renderRegister() {
+  root().innerHTML = `
+    <div class="brand">prep<span class="plus">+</span></div>
+    <h2>Create your account</h2>
+    <div id="reg-error"></div>
+    <label for="r-phone">Phone number</label>
+    <input id="r-phone" type="tel" placeholder="07XXXXXXXX">
+    <label for="r-pin">Choose a 4-digit PIN</label>
+    <input id="r-pin" type="password" inputmode="numeric" maxlength="4" placeholder="••••">
+    <div class="hint">You'll use this PIN to log in next time.</div>
+    <label for="r-name">Name</label>
+    <input id="r-name" type="text" placeholder="Your name">
+    <label for="r-school">School</label>
+    <input id="r-school" type="text" placeholder="e.g. Kings College Budo">
+    <label for="r-level">Level</label>
+    <select id="r-level">
+      <option value="UCE">UCE (O-level)</option>
+      <option value="UACE">UACE (A-level)</option>
+    </select>
+    <button class="btn-primary" onclick="doRegister()">Create account</button>
+    <button class="btn-link" onclick="renderWelcome()">← Back</button>
+  `;
+}
+
+const doRegister = safeRender(async function () {
+  const phone = document.getElementById("r-phone").value.trim();
+  const pin = document.getElementById("r-pin").value.trim();
+  const name = document.getElementById("r-name").value.trim();
+  const school = document.getElementById("r-school").value.trim();
+  const level = document.getElementById("r-level").value;
+  const errEl = document.getElementById("reg-error");
+  errEl.innerHTML = "";
+
+  if (!phone || !/^\d{9,13}$/.test(phone.replace(/\s/g, ""))) { errEl.innerHTML = `<div class="error-banner">Enter a valid phone number.</div>`; return; }
+  if (!/^\d{4}$/.test(pin)) { errEl.innerHTML = `<div class="error-banner">PIN must be exactly 4 digits.</div>`; return; }
+  if (!name) { errEl.innerHTML = `<div class="error-banner">Please enter your name.</div>`; return; }
+
+  await ensureSession(sb);
+  const { data, error } = await sb.rpc("register_with_pin", { p_phone: phone, p_pin: pin, p_name: name, p_school: school || null, p_level: level });
+  if (error) { errEl.innerHTML = `<div class="error-banner">${escapeHtml(friendlyError(error))}</div>`; return; }
+  state.profile = data;
+  renderSubjectList();
+});
+
+// ---------- LOGIN ----------
+function renderLogin() {
+  root().innerHTML = `
+    <div class="brand">prep<span class="plus">+</span></div>
+    <h2>Welcome back</h2>
+    <div id="login-error"></div>
+    <label for="l-phone">Phone number</label>
+    <input id="l-phone" type="tel" placeholder="07XXXXXXXX">
+    <label for="l-pin">PIN</label>
+    <input id="l-pin" type="password" inputmode="numeric" maxlength="4" placeholder="••••">
+    <button class="btn-primary" onclick="doLogin()">Log in</button>
+    <button class="btn-link" onclick="renderWelcome()">← Back</button>
+  `;
+}
+
+const doLogin = safeRender(async function () {
+  const phone = document.getElementById("l-phone").value.trim();
+  const pin = document.getElementById("l-pin").value.trim();
+  const errEl = document.getElementById("login-error");
+  errEl.innerHTML = "";
+  await ensureSession(sb);
+  const { data, error } = await sb.rpc("login_with_pin", { p_phone: phone, p_pin: pin });
+  if (error) { errEl.innerHTML = `<div class="error-banner">${escapeHtml(friendlyError(error))}</div>`; return; }
+  state.profile = data;
+  renderSubjectList();
+});
+
+// ---------- SUBJECT LIST ----------
+async function renderSubjectList() {
+  const p = state.profile;
+  const subscribed = p.subscription_status === "active" && (!p.subscription_expires_at || new Date(p.subscription_expires_at) > new Date());
+  root().innerHTML = `
+    <div class="top-bar">
+      <div class="brand">prep<span class="plus">+</span></div>
+      <div>
+        <button class="icon-btn" onclick="renderProfile()">Profile</button>
+        <button class="icon-btn" onclick="logout()">Log out</button>
+      </div>
+    </div>
+    <h2>Hi ${escapeHtml(p.name || "")} 👋</h2>
+    ${!subscribed ? `<div class="card"><h3>Unlock every subject</h3><p style="margin-bottom:10px">You have free access to sample subjects. Subscribe for UGX 3,000/month to unlock everything.</p><button class="btn-primary" style="margin-top:0" onclick="renderSubscribe()">Subscribe</button></div>` : ""}
+    <div id="subject-list"><div class="center-loading">Loading subjects…</div></div>
+  `;
+  const { data, error } = await sb.from("subjects").select("*").order("level").order("name");
+  const listEl = document.getElementById("subject-list");
+  if (error) { listEl.innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  if (!data.length) { listEl.innerHTML = `<div class="empty-state">No subjects have been added yet — check back soon.</div>`; return; }
+  state.subjects = data;
+  listEl.innerHTML = data.map(s => {
+    const locked = !s.is_free && !subscribed;
+    return `
+      <div class="subject-row ${locked ? "locked" : ""}" onclick="${locked ? "renderSubscribe()" : `openSubject('${s.id}')`}">
+        <div class="subject-icon">${locked ? "🔒" : "📘"}</div>
+        <div class="subject-info">
+          <div class="subject-name">${escapeHtml(s.name)}</div>
+          <div class="subject-meta">${s.level}</div>
+        </div>
+        ${s.is_free ? `<span class="badge badge-free">Free</span>` : ""}
+      </div>`;
+  }).join("");
+}
+
+// ---------- SUBSCRIBE ----------
+function renderSubscribe() {
+  const p = state.profile;
+  const pendingNote = p.subscription_status === "pending"
+    ? `<div class="error-banner" style="background:var(--yellow-dim);border-color:var(--yellow);color:var(--yellow)">Payment submitted — waiting for confirmation.</div>` : "";
+  root().innerHTML = `
+    <div id="subscribe-screen">
+      <div class="top-bar"><div class="brand">prep<span class="plus">+</span></div><button class="icon-btn" onclick="renderSubjectList()">← Back</button></div>
+      <h2>Unlock every subject</h2>
+      <p>UGX 3,000 / month for full access to every subject and past paper.</p>
+      ${pendingNote}
+      <div class="card">
+        <h3>1. Send mobile money</h3>
+        <p style="margin-bottom:8px">Send <strong style="color:var(--chalk)">UGX 3,000</strong> to:</p>
+        <p style="color:var(--chalk);font-family:var(--font-mono);font-size:15px;margin-bottom:2px">MTN: 0779 477 048</p>
+        <p style="color:var(--chalk);font-family:var(--font-mono);font-size:15px">Airtel: 0748 237 633</p>
+        <p style="font-size:12.5px;margin-top:10px">(Account name: Samuel)</p>
+      </div>
+      <div class="card">
+        <h3>2. Confirm your payment</h3>
+        <label for="s-network">Network used</label>
+        <select id="s-network"><option value="MTN">MTN Mobile Money</option><option value="Airtel">Airtel Money</option></select>
+        <label for="s-ref">Transaction message / reference (optional)</label>
+        <input id="s-ref" type="text" placeholder="Paste the confirmation SMS text or ID">
+        <div id="sub-error"></div>
+        <button class="btn-primary" onclick="submitSubscription()">I've paid</button>
+      </div>
+    </div>
+  `;
+}
+
+const submitSubscription = safeRender(async function () {
+  const network = document.getElementById("s-network").value;
+  const ref = document.getElementById("s-ref").value.trim();
+  const { error } = await sb.from("subscription_requests").insert({ profile_id: state.profile.id, network, transaction_ref: ref || null });
+  if (error) { document.getElementById("sub-error").innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  const { data } = await sb.from("profiles").update({ subscription_status: "pending" }).eq("id", state.profile.id).select().maybeSingle();
+  if (data) state.profile = data;
+  renderSubscribe();
+});
+
+// ---------- PROFILE ----------
+async function renderProfile() {
+  const p = state.profile;
+  root().innerHTML = `
+    <div class="top-bar"><button class="icon-btn" onclick="renderSubjectList()">← Back</button><button class="icon-btn" onclick="logout()">Log out</button></div>
+    <h2>My profile</h2>
+    <div class="card">
+      <p><strong style="color:var(--chalk)">Name:</strong> ${escapeHtml(p.name || "")}</p>
+      <p><strong style="color:var(--chalk)">School:</strong> ${escapeHtml(p.school || "—")}</p>
+      <p><strong style="color:var(--chalk)">Level:</strong> ${escapeHtml(p.level || "—")}</p>
+      <p><strong style="color:var(--chalk)">Subscription:</strong> <span class="badge badge-${p.subscription_status}">${p.subscription_status}</span>
+      ${p.subscription_expires_at ? ` until ${new Date(p.subscription_expires_at).toLocaleDateString()}` : ""}</p>
+    </div>
+    <h3>Past attempts</h3>
+    <div id="history"><div class="center-loading">Loading history…</div></div>
+  `;
+  const { data, error } = await sb.from("quiz_attempts").select("*, subjects(name)").order("created_at", { ascending: false }).limit(20);
+  const el = document.getElementById("history");
+  if (error) { el.innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  if (!data.length) { el.innerHTML = `<div class="empty-state">No quizzes taken yet — go pick a subject!</div>`; return; }
+  el.innerHTML = data.map(a => `
+    <div class="topic-row">
+      <span>${escapeHtml(a.subjects?.name || "Subject")} · ${a.mode}</span>
+      <span>${a.score}/${a.total} · ${timeAgo(a.created_at)}</span>
+    </div>
+  `).join("");
+}
+
+// ---------- SUBJECT DETAIL (mode picker) ----------
+async function openSubject(subjectId) {
+  const subject = state.subjects.find(s => s.id === subjectId);
+  state.subject = subject;
+  root().innerHTML = `
+    <div class="top-bar"><button class="icon-btn" onclick="renderSubjectList()">← Subjects</button></div>
+    <h2>${escapeHtml(subject.name)}</h2>
+    <p>${subject.level}</p>
+    <div class="mode-grid">
+      <div class="mode-card" onclick="showTopics()"><div class="mtitle">Practice by topic</div><div class="msub">Focus on one area</div></div>
+      <div class="mode-card" onclick="showPapers()"><div class="mtitle">Full past paper</div><div class="msub">By year</div></div>
+      <div class="mode-card" onclick="startTimedExam()"><div class="mtitle">Timed exam</div><div class="msub">30 min, exam pressure</div></div>
+      <div class="mode-card" onclick="showPaperFiles()"><div class="mtitle">Past papers library</div><div class="msub">Scanned originals</div></div>
+    </div>
+    <div id="mode-detail"></div>
+  `;
+}
+
+const showPaperFiles = safeRender(async function () {
+  const { data, error } = await sb.from("paper_files").select("*").eq("subject_id", state.subject.id).order("uploaded_at", { ascending: false });
+  const el = document.getElementById("mode-detail");
+  if (error) { el.innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  if (!data.length) { el.innerHTML = `<div class="empty-state">No past papers uploaded for this subject yet.</div>`; return; }
+  el.innerHTML = `<h3>Uploaded papers</h3>` + data.map(f => `
+    <div class="subject-row" onclick="openPaperFile('${f.storage_path}')">
+      <div class="subject-icon">${f.file_type === "pdf" ? "📄" : "🖼️"}</div>
+      <div class="subject-info"><div class="subject-name">${escapeHtml(f.title)}</div><div class="subject-meta">${f.year || ""} ${escapeHtml(f.paper || "")}</div></div>
+    </div>`).join("");
+});
+
+const openPaperFile = safeRender(async function (path) {
+  const { data, error } = await sb.storage.from("papers").createSignedUrl(path, 300);
+  if (error) { alert("Couldn't open this file — your subscription may have expired."); return; }
+  window.open(data.signedUrl, "_blank");
+});
+
+const showTopics = safeRender(async function () {
+  const { data, error } = await sb.from("topics").select("*").eq("subject_id", state.subject.id).order("name");
+  const el = document.getElementById("mode-detail");
+  if (error) { el.innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  if (!data.length) { el.innerHTML = `<div class="empty-state">No topics added for this subject yet.</div>`; return; }
+  el.innerHTML = `<h3>Choose a topic</h3>` + data.map(t => `
+    <div class="subject-row" onclick="startQuiz('topic', {topicId:'${t.id}'})">
+      <div class="subject-icon">📚</div>
+      <div class="subject-info"><div class="subject-name">${escapeHtml(t.name)}</div></div>
+    </div>`).join("");
+});
+
+const showPapers = safeRender(async function () {
+  const { data, error } = await sb.from("questions").select("year, paper").eq("subject_id", state.subject.id);
+  const el = document.getElementById("mode-detail");
+  if (error) { el.innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  if (!data.length) { el.innerHTML = `<div class="empty-state">No past papers added for this subject yet.</div>`; return; }
+  const combos = {};
+  data.forEach(q => { const key = `${q.year || "—"} ${q.paper || ""}`; combos[key] = { year: q.year, paper: q.paper }; });
+  el.innerHTML = `<h3>Choose a paper</h3>` + Object.entries(combos).sort((a,b) => (b[1].year||0)-(a[1].year||0)).map(([key, c]) => `
+    <div class="subject-row" onclick="startQuiz('paper', {year:${c.year || "null"}, paper:${c.paper ? `'${c.paper}'` : "null"}})">
+      <div class="subject-icon">📝</div>
+      <div class="subject-info"><div class="subject-name">${escapeHtml(key)}</div></div>
+    </div>`).join("");
+});
+
+async function startTimedExam() {
+  await startQuiz("timed", {});
+}
+
+// ---------- QUIZ ----------
+const startQuiz = safeRender(async function (mode, params) {
+  let query = sb.from("questions").select("*").eq("subject_id", state.subject.id);
+  if (mode === "topic") query = query.eq("topic_id", params.topicId);
+  if (mode === "paper") {
+    if (params.year) query = query.eq("year", params.year);
+    if (params.paper) query = query.eq("paper", params.paper);
+  }
+  const { data, error } = await query;
+  if (error) throw error;
+  if (!data.length) { document.getElementById("mode-detail").innerHTML = `<div class="empty-state">No questions available yet.</div>`; return; }
+
+  let pool = [...data];
+  for (let i = pool.length - 1; i > 0; i--) { const j = Math.floor(Math.random() * (i + 1)); [pool[i], pool[j]] = [pool[j], pool[i]]; }
+  if (mode === "timed") pool = pool.slice(0, 15);
+
+  const { data: topicRows } = await sb.from("topics").select("id, name").eq("subject_id", state.subject.id);
+  const topicMap = {};
+  (topicRows || []).forEach(t => { topicMap[t.id] = t.name; });
+
+  state.quiz = { mode, questions: pool, index: 0, score: 0, answered: false, results: [], timeLeft: mode === "timed" ? 30 * 60 : null, topicMap };
+  renderQuizScreen();
+  if (mode === "timed") startQuizTimer();
+});
+
+function startQuizTimer() {
+  clearInterval(state.timerInterval);
+  state.timerInterval = setInterval(() => {
+    if (!state.quiz) { clearInterval(state.timerInterval); return; }
+    state.quiz.timeLeft--;
+    const el = document.getElementById("quiz-timer");
+    if (el) el.textContent = formatTime(state.quiz.timeLeft);
+    if (state.quiz.timeLeft <= 0) { clearInterval(state.timerInterval); finishQuiz(); }
+  }, 1000);
+}
+
+function formatTime(secs) {
+  const m = Math.floor(secs / 60), s = secs % 60;
+  return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function renderQuizScreen() {
+  const q = state.quiz;
+  const question = q.questions[q.index];
+  root().innerHTML = `
+    <div class="quiz-topbar">
+      <span class="qcount">Question ${q.index + 1} of ${q.questions.length}</span>
+      ${q.mode === "timed" ? `<span class="qtopic" id="quiz-timer">${formatTime(q.timeLeft)}</span>` : `<span class="qtopic">${escapeHtml(state.subject.name)}</span>`}
+    </div>
+    <div class="progress-track"><div class="progress-fill" style="width:${Math.round((q.index / q.questions.length) * 100)}%"></div></div>
+    <p class="qtext">${escapeHtml(question.question_text)}</p>
+    <div id="quiz-options">
+      ${question.options.map((opt, idx) => `<button class="option-btn" onclick="selectAnswer(${idx})">${String.fromCharCode(97 + idx)}) ${escapeHtml(opt)}</button>`).join("")}
+    </div>
+    <div id="quiz-explain"></div>
+    <button class="btn-primary" id="quiz-next" style="display:none" onclick="nextQuestion()">Next question</button>
+  `;
+}
+
+function selectAnswer(idx) {
+  const q = state.quiz;
+  if (q.answered) return;
+  q.answered = true;
+  const question = q.questions[q.index];
+  const correct = question.correct_index;
+  const isCorrect = idx === correct;
+  if (isCorrect) q.score++;
+  q.results.push({ question_id: question.id, topic_id: question.topic_id, selected_index: idx, is_correct: isCorrect });
+
+  const buttons = document.querySelectorAll("#quiz-options .option-btn");
+  buttons.forEach((b, bi) => {
+    if (bi === correct) b.classList.add("correct");
+    else if (bi === idx) b.classList.add("wrong");
+  });
+  if (question.explanation) {
+    document.getElementById("quiz-explain").innerHTML = `<div class="explain-box">${escapeHtml(question.explanation)}</div>`;
+  }
+  const nextBtn = document.getElementById("quiz-next");
+  nextBtn.style.display = "block";
+  nextBtn.textContent = q.index === q.questions.length - 1 ? "See results" : "Next question";
+}
+
+function nextQuestion() {
+  const q = state.quiz;
+  q.index++;
+  q.answered = false;
+  if (q.index >= q.questions.length) { finishQuiz(); return; }
+  renderQuizScreen();
+}
+
+const finishQuiz = safeRender(async function () {
+  clearInterval(state.timerInterval);
+  const q = state.quiz;
+  const { error } = await sb.rpc("submit_quiz_attempt", {
+    p_subject_id: state.subject.id, p_mode: q.mode, p_score: q.score, p_total: q.questions.length, p_answers: q.results
+  });
+  renderScoreScreen(error);
+});
+
+function renderScoreScreen(saveError) {
+  const q = state.quiz;
+  const byTopic = {};
+  q.questions.forEach((question, i) => {
+    const key = question.topic_id || "general";
+    if (!byTopic[key]) byTopic[key] = { name: (q.topicMap && q.topicMap[question.topic_id]) || "General", correct: 0, total: 0 };
+    byTopic[key].total++;
+    if (q.results[i]?.is_correct) byTopic[key].correct++;
+  });
+  root().innerHTML = `
+    <div class="top-bar"><div class="brand">prep<span class="plus">+</span></div></div>
+    <div class="score-big">${q.score} / ${q.questions.length}</div>
+    <div class="score-label">${escapeHtml(state.subject.name)} · ${q.mode}</div>
+    ${saveError ? `<div class="error-banner">Your score didn't save (${escapeHtml(saveError.message)}), but here's how you did:</div>` : ""}
+    <h3>By topic</h3>
+    ${Object.values(byTopic).map(t => `<div class="topic-row"><span>${escapeHtml(t.name)}</span><span>${t.correct}/${t.total}</span></div>`).join("")}
+    <button class="btn-primary" onclick="openSubject(state.subject.id)">Back to ${escapeHtml(state.subject.name)}</button>
+    <button class="btn-secondary" style="margin-top:10px" onclick="renderSubjectList()">All subjects</button>
+  `;
+}
+</script>
+</body>
+</html>

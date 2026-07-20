@@ -1,0 +1,432 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>prep+ admin</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="admin-wrap">
+<div id="app"><div class="center-loading">Loading…</div></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="config.js"></script>
+<script src="shared.js"></script>
+<script>
+let sb;
+let state = { admin: null, tab: "content", subjects: [], topics: [], users: [], requests: [], selectedSubject: null };
+const root = () => document.getElementById("app");
+
+window.addEventListener("DOMContentLoaded", () => {
+  try { sb = initSupabase(); } catch (e) { return; }
+  boot();
+});
+
+const boot = safeRender(async function () {
+  const { data: { session } } = await sb.auth.getSession();
+  if (session && session.user.email) {
+    const { data: isAdmin } = await sb.rpc("is_admin");
+    if (isAdmin) { state.admin = { email: session.user.email }; return renderDashboard(); }
+    await sb.auth.signOut();
+  }
+  renderLogin();
+});
+
+function renderLogin() {
+  root().innerHTML = `
+    <div class="brand">prep<span class="plus">+</span> <span style="font-size:14px;color:var(--chalk-muted);font-family:var(--font-body)">admin</span></div>
+    <p>Staff access only.</p>
+    <div id="login-error"></div>
+    <label for="a-email">Email</label>
+    <input id="a-email" type="email" autocomplete="username">
+    <label for="a-pass">Password</label>
+    <input id="a-pass" type="password" autocomplete="current-password" onkeydown="if(event.key==='Enter')doAdminLogin()">
+    <button class="btn-primary" onclick="doAdminLogin()">Log in</button>
+    <div class="hint" style="margin-top:16px">Admin accounts are created in the Supabase dashboard — see SETUP_GUIDE.md step 6.</div>
+  `;
+}
+
+const doAdminLogin = safeRender(async function () {
+  const email = document.getElementById("a-email").value.trim();
+  const password = document.getElementById("a-pass").value;
+  const errEl = document.getElementById("login-error");
+  errEl.innerHTML = "";
+  const { data, error } = await sb.auth.signInWithPassword({ email, password });
+  if (error) { errEl.innerHTML = `<div class="error-banner">Invalid email or password.</div>`; return; }
+  const { data: isAdmin } = await sb.rpc("is_admin");
+  if (!isAdmin) {
+    await sb.auth.signOut();
+    errEl.innerHTML = `<div class="error-banner">That account isn't on the admin list. Add its email to admin_allowlist in Supabase.</div>`;
+    return;
+  }
+  state.admin = { email: data.user.email };
+  renderDashboard();
+});
+
+async function adminLogout() {
+  await sb.auth.signOut();
+  state.admin = null;
+  renderLogin();
+}
+
+// ---------- DASHBOARD SHELL ----------
+async function renderDashboard() {
+  root().innerHTML = `
+    <div class="admin-header">
+      <div class="brand">prep<span class="plus">+</span> <span style="font-size:14px;color:var(--chalk-muted);font-family:var(--font-body)">admin</span></div>
+      <div><span style="color:var(--chalk-muted);font-size:13px;margin-right:12px">${escapeHtml(state.admin.email)}</span>
+      <button class="icon-btn" onclick="adminLogout()">Log out</button></div>
+    </div>
+    <div id="stats" class="stat-row"></div>
+    <div class="tabs">
+      <button class="tab ${state.tab === "content" ? "active" : ""}" onclick="switchTab('content')">Content</button>
+      <button class="tab ${state.tab === "users" ? "active" : ""}" onclick="switchTab('users')">Users</button>
+      <button class="tab ${state.tab === "requests" ? "active" : ""}" onclick="switchTab('requests')">Payment requests</button>
+    </div>
+    <div id="tab-content"><div class="center-loading">Loading…</div></div>
+  `;
+  await loadAll();
+}
+
+async function loadAll() {
+  const [{ data: subjects }, { data: users }, { data: requests }] = await Promise.all([
+    sb.from("subjects").select("*").order("level").order("name"),
+    sb.from("profiles").select("*").order("created_at", { ascending: false }),
+    sb.from("subscription_requests").select("*, profiles(name, phone)").eq("status", "pending").order("created_at", { ascending: false })
+  ]);
+  state.subjects = subjects || [];
+  state.users = users || [];
+  state.requests = requests || [];
+  renderStats();
+  renderTab();
+}
+
+function renderStats() {
+  const active = state.users.filter(u => u.subscription_status === "active").length;
+  document.getElementById("stats").innerHTML = `
+    <div class="stat-box"><div class="num">${state.subjects.length}</div><div class="label">Subjects</div></div>
+    <div class="stat-box"><div class="num">${state.users.length}</div><div class="label">Total users</div></div>
+    <div class="stat-box"><div class="num">${active}</div><div class="label">Active subscribers</div></div>
+    <div class="stat-box"><div class="num">${state.requests.length}</div><div class="label">Pending payments</div></div>
+  `;
+}
+
+function switchTab(tab) {
+  state.tab = tab;
+  document.querySelectorAll(".tab").forEach(t => t.classList.remove("active"));
+  event.target.classList.add("active");
+  renderTab();
+}
+
+function renderTab() {
+  if (state.tab === "content") renderContentTab();
+  else if (state.tab === "users") renderUsersTable();
+  else renderRequestsTable();
+}
+
+// ---------- CONTENT TAB ----------
+function renderContentTab() {
+  const el = document.getElementById("tab-content");
+  el.innerHTML = `
+    <div class="card">
+      <h3>Add a subject</h3>
+      <div class="opt-input-row">
+        <input id="new-subject-name" type="text" placeholder="e.g. Biology">
+        <select id="new-subject-level" style="width:140px"><option value="UCE">UCE</option><option value="UACE">UACE</option></select>
+        <label style="margin:0;display:flex;align-items:center;gap:6px;white-space:nowrap;color:var(--chalk-muted);font-size:13px"><input type="checkbox" id="new-subject-free" style="width:auto"> Free</label>
+        <button class="btn-small btn-success" onclick="addSubject()">Add</button>
+      </div>
+      <div id="subject-add-error"></div>
+    </div>
+    <h3>Subjects</h3>
+    <div id="subject-list"></div>
+    <div id="subject-detail"></div>
+  `;
+  renderSubjectListAdmin();
+}
+
+function renderSubjectListAdmin() {
+  const el = document.getElementById("subject-list");
+  if (!state.subjects.length) { el.innerHTML = `<div class="empty-state">No subjects yet — add one above.</div>`; return; }
+  el.innerHTML = state.subjects.map(s => `
+    <div class="subject-row" onclick="openSubjectAdmin('${s.id}')">
+      <div class="subject-icon">📘</div>
+      <div class="subject-info"><div class="subject-name">${escapeHtml(s.name)}</div><div class="subject-meta">${s.level}</div></div>
+      ${s.is_free ? `<span class="badge badge-free">Free</span>` : ""}
+      <button class="btn-small btn-danger" onclick="event.stopPropagation();deleteSubject('${s.id}')">Delete</button>
+    </div>
+  `).join("");
+}
+
+const addSubject = safeRender(async function () {
+  const name = document.getElementById("new-subject-name").value.trim();
+  const level = document.getElementById("new-subject-level").value;
+  const isFree = document.getElementById("new-subject-free").checked;
+  const errEl = document.getElementById("subject-add-error");
+  if (!name) { errEl.innerHTML = `<div class="error-banner">Enter a subject name.</div>`; return; }
+  const { error } = await sb.from("subjects").insert({ name, level, is_free: isFree });
+  if (error) { errEl.innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  document.getElementById("new-subject-name").value = "";
+  await loadAll();
+  renderContentTab();
+});
+
+const deleteSubject = safeRender(async function (id) {
+  if (!confirm("Delete this subject and all its topics/questions? This cannot be undone.")) return;
+  await sb.from("subjects").delete().eq("id", id);
+  await loadAll();
+  renderContentTab();
+});
+
+const openSubjectAdmin = safeRender(async function (subjectId) {
+  const subject = state.subjects.find(s => s.id === subjectId);
+  state.selectedSubject = subject;
+  const [{ data: topics }, { data: questions }] = await Promise.all([
+    sb.from("topics").select("*").eq("subject_id", subjectId).order("name"),
+    sb.from("questions").select("*").eq("subject_id", subjectId).order("created_at", { ascending: false })
+  ]);
+  state.topics = topics || [];
+
+  const detail = document.getElementById("subject-detail");
+  detail.innerHTML = `
+    <div class="card">
+      <h3>${escapeHtml(subject.name)} — topics</h3>
+      <div class="opt-input-row">
+        <input id="new-topic-name" type="text" placeholder="e.g. Genetics">
+        <button class="btn-small btn-success" onclick="addTopic('${subjectId}')">Add topic</button>
+      </div>
+      <div id="topic-list">
+        ${state.topics.length ? state.topics.map(t => `<span class="badge" style="background:var(--bg-card-raised);color:var(--chalk);margin:4px 6px 4px 0;cursor:pointer" onclick="deleteTopic('${t.id}','${subjectId}')">${escapeHtml(t.name)} ✕</span>`).join("") : `<p style="margin:8px 0 0">No topics yet.</p>`}
+      </div>
+    </div>
+
+    <div class="card">
+      <h3>Upload a scanned past paper</h3>
+      <p style="margin-bottom:10px">Fastest way to add content — scan or photograph a paper and upload it as-is. Students see it after subscribing (or immediately if this subject is free).</p>
+      <label for="pf-title">Title</label>
+      <input id="pf-title" type="text" placeholder="e.g. Biology Paper 1">
+      <div class="opt-input-row">
+        <input id="pf-year" type="number" placeholder="Year (e.g. 2023)" style="max-width:140px">
+        <input id="pf-paper" type="text" placeholder="Paper (e.g. Paper 1)">
+      </div>
+      <label for="pf-file">File (image or PDF)</label>
+      <input id="pf-file" type="file" accept="image/*,application/pdf">
+      <div id="pf-error"></div>
+      <button class="btn-primary" onclick="uploadPaperFile('${subjectId}')">Upload</button>
+    </div>
+    <div id="paper-files-list"></div>
+
+    <div class="card">
+      <h3>Add a question (optional — for interactive quizzes)</h3>
+      <label for="q-topic">Topic (optional)</label>
+      <select id="q-topic"><option value="">— none —</option>${state.topics.map(t => `<option value="${t.id}">${escapeHtml(t.name)}</option>`).join("")}</select>
+      <div class="opt-input-row">
+        <input id="q-year" type="number" placeholder="Year (e.g. 2023)" style="max-width:140px">
+        <input id="q-paper" type="text" placeholder="Paper (e.g. Paper 1)">
+      </div>
+      <label for="q-text">Question</label>
+      <textarea id="q-text" rows="2" placeholder="Type the question text"></textarea>
+      <label>Options (mark the correct one)</label>
+      ${[0,1,2,3].map(i => `
+        <div class="opt-input-row">
+          <input type="radio" name="q-correct" value="${i}" ${i===0 ? "checked" : ""}>
+          <input type="text" id="q-opt-${i}" placeholder="Option ${String.fromCharCode(65+i)}">
+        </div>`).join("")}
+      <label for="q-explain">Explanation (optional, shown after answering)</label>
+      <textarea id="q-explain" rows="2" placeholder="Why this is the right answer"></textarea>
+      <div id="q-add-error"></div>
+      <button class="btn-primary" onclick="addQuestion('${subjectId}')">Add question</button>
+    </div>
+
+    <h3>Questions in this subject (${questions ? questions.length : 0})</h3>
+    <div id="question-list">
+      ${(questions && questions.length) ? questions.map(q => `
+        <div class="card" style="margin-bottom:10px">
+          <p style="color:var(--chalk);margin-bottom:6px">${escapeHtml(q.question_text)}</p>
+          <p style="font-size:12.5px;margin:0">${q.year ? "Year " + q.year + " · " : ""}${escapeHtml(q.paper || "")} ${q.topic_id ? "· " + escapeHtml((state.topics.find(t=>t.id===q.topic_id)||{}).name || "") : ""}</p>
+          <button class="btn-small btn-danger" style="margin-top:8px" onclick="deleteQuestion('${q.id}','${subjectId}')">Delete</button>
+        </div>
+      `).join("") : `<div class="empty-state">No questions added yet.</div>`}
+    </div>
+  `;
+  renderPaperFilesList(subjectId);
+});
+
+async function renderPaperFilesList(subjectId) {
+  const { data, error } = await sb.from("paper_files").select("*").eq("subject_id", subjectId).order("uploaded_at", { ascending: false });
+  const el = document.getElementById("paper-files-list");
+  if (error) { el.innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  if (!data.length) { el.innerHTML = `<div class="empty-state">No past papers uploaded yet.</div>`; return; }
+  el.innerHTML = `<h3>Uploaded papers (${data.length})</h3>` + data.map(f => `
+    <div class="topic-row">
+      <span>${f.file_type === "pdf" ? "📄" : "🖼️"} ${escapeHtml(f.title)}${f.year ? " · " + f.year : ""}${f.paper ? " · " + escapeHtml(f.paper) : ""}</span>
+      <span class="action-cell">
+        <button class="btn-small btn-secondary" onclick="viewPaperFile('${f.storage_path}')">View</button>
+        <button class="btn-small btn-danger" onclick="deletePaperFile('${f.id}','${f.storage_path}','${subjectId}')">Delete</button>
+      </span>
+    </div>
+  `).join("");
+}
+
+const uploadPaperFile = safeRender(async function (subjectId) {
+  const title = document.getElementById("pf-title").value.trim();
+  const year = document.getElementById("pf-year").value ? parseInt(document.getElementById("pf-year").value) : null;
+  const paper = document.getElementById("pf-paper").value.trim() || null;
+  const fileInput = document.getElementById("pf-file");
+  const file = fileInput.files[0];
+  const errEl = document.getElementById("pf-error");
+  errEl.innerHTML = "";
+  if (!title) { errEl.innerHTML = `<div class="error-banner">Enter a title.</div>`; return; }
+  if (!file) { errEl.innerHTML = `<div class="error-banner">Choose a file to upload.</div>`; return; }
+
+  const path = `${subjectId}/${Date.now()}-${file.name}`;
+  const { error: upErr } = await sb.storage.from("papers").upload(path, file);
+  if (upErr) { errEl.innerHTML = `<div class="error-banner">${escapeHtml(upErr.message)}</div>`; return; }
+
+  const fileType = file.type === "application/pdf" ? "pdf" : "image";
+  const { error: rowErr } = await sb.from("paper_files").insert({ subject_id: subjectId, title, year, paper, storage_path: path, file_type: fileType });
+  if (rowErr) { errEl.innerHTML = `<div class="error-banner">${escapeHtml(rowErr.message)}</div>`; return; }
+
+  document.getElementById("pf-title").value = "";
+  document.getElementById("pf-year").value = "";
+  document.getElementById("pf-paper").value = "";
+  fileInput.value = "";
+  renderPaperFilesList(subjectId);
+});
+
+const viewPaperFile = safeRender(async function (path) {
+  const { data, error } = await sb.storage.from("papers").createSignedUrl(path, 300);
+  if (error) { alert("Couldn't open file: " + error.message); return; }
+  window.open(data.signedUrl, "_blank");
+});
+
+const deletePaperFile = safeRender(async function (id, path, subjectId) {
+  if (!confirm("Delete this uploaded paper?")) return;
+  await sb.storage.from("papers").remove([path]);
+  await sb.from("paper_files").delete().eq("id", id);
+  renderPaperFilesList(subjectId);
+});
+
+const addTopic = safeRender(async function (subjectId) {
+  const name = document.getElementById("new-topic-name").value.trim();
+  if (!name) return;
+  await sb.from("topics").insert({ subject_id: subjectId, name });
+  document.getElementById("new-topic-name").value = "";
+  await openSubjectAdmin(subjectId);
+});
+
+const deleteTopic = safeRender(async function (topicId, subjectId) {
+  if (!confirm("Delete this topic? Questions in it will keep their other data but lose this topic tag.")) return;
+  await sb.from("topics").delete().eq("id", topicId);
+  await openSubjectAdmin(subjectId);
+});
+
+const addQuestion = safeRender(async function (subjectId) {
+  const topicId = document.getElementById("q-topic").value || null;
+  const year = document.getElementById("q-year").value ? parseInt(document.getElementById("q-year").value) : null;
+  const paper = document.getElementById("q-paper").value.trim() || null;
+  const text = document.getElementById("q-text").value.trim();
+  const options = [0,1,2,3].map(i => document.getElementById(`q-opt-${i}`).value.trim());
+  const correctIndex = parseInt(document.querySelector('input[name="q-correct"]:checked').value);
+  const explanation = document.getElementById("q-explain").value.trim() || null;
+  const errEl = document.getElementById("q-add-error");
+
+  if (!text) { errEl.innerHTML = `<div class="error-banner">Enter the question text.</div>`; return; }
+  if (options.some(o => !o)) { errEl.innerHTML = `<div class="error-banner">Fill in all 4 options.</div>`; return; }
+
+  const { error } = await sb.from("questions").insert({
+    subject_id: subjectId, topic_id: topicId, year, paper, question_text: text,
+    options, correct_index: correctIndex, explanation
+  });
+  if (error) { errEl.innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  await openSubjectAdmin(subjectId);
+});
+
+const deleteQuestion = safeRender(async function (id, subjectId) {
+  if (!confirm("Delete this question?")) return;
+  await sb.from("questions").delete().eq("id", id);
+  await openSubjectAdmin(subjectId);
+});
+
+// ---------- USERS TAB ----------
+function renderUsersTable() {
+  const el = document.getElementById("tab-content");
+  if (!state.users.length) { el.innerHTML = `<div class="empty-state">No users yet.</div>`; return; }
+  el.innerHTML = `
+    <table>
+      <thead><tr><th>Name</th><th>Phone</th><th>School</th><th>Level</th><th>Status</th><th>Expires</th><th>Actions</th></tr></thead>
+      <tbody>
+        ${state.users.map(u => `
+          <tr>
+            <td data-label="Name">${escapeHtml(u.name || "—")}</td>
+            <td data-label="Phone">${escapeHtml(u.phone)}</td>
+            <td data-label="School">${escapeHtml(u.school || "—")}</td>
+            <td data-label="Level">${escapeHtml(u.level || "—")}</td>
+            <td data-label="Status"><span class="badge badge-${u.subscription_status}">${u.subscription_status}</span></td>
+            <td data-label="Expires">${u.subscription_expires_at ? new Date(u.subscription_expires_at).toLocaleDateString() : "—"}</td>
+            <td data-label="Actions"><div class="action-cell">
+              ${u.subscription_status !== "active" ? `<button class="btn-small btn-success" onclick="activateUser('${u.id}')">Activate</button>` : ""}
+              ${u.subscription_status === "active" ? `<button class="btn-small btn-secondary" onclick="deactivateUser('${u.id}')">Deactivate</button>` : ""}
+              <button class="btn-small btn-danger" onclick="deleteUser('${u.id}')">Delete</button>
+            </div></td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+const activateUser = safeRender(async function (id) {
+  const expires = new Date(); expires.setDate(expires.getDate() + 30);
+  await sb.from("profiles").update({ subscription_status: "active", subscription_expires_at: expires.toISOString() }).eq("id", id);
+  await loadAll();
+});
+const deactivateUser = safeRender(async function (id) {
+  await sb.from("profiles").update({ subscription_status: "expired" }).eq("id", id);
+  await loadAll();
+});
+const deleteUser = safeRender(async function (id) {
+  if (!confirm("Delete this user permanently?")) return;
+  await sb.from("profiles").delete().eq("id", id);
+  await loadAll();
+});
+
+// ---------- PAYMENT REQUESTS TAB ----------
+function renderRequestsTable() {
+  const el = document.getElementById("tab-content");
+  if (!state.requests.length) { el.innerHTML = `<div class="empty-state">No pending payment requests.</div>`; return; }
+  el.innerHTML = `
+    <table>
+      <thead><tr><th>User</th><th>Phone</th><th>Network</th><th>Reference</th><th>Submitted</th><th>Actions</th></tr></thead>
+      <tbody>
+        ${state.requests.map(r => `
+          <tr>
+            <td data-label="User">${escapeHtml(r.profiles?.name || "—")}</td>
+            <td data-label="Phone">${escapeHtml(r.profiles?.phone || "—")}</td>
+            <td data-label="Network">${escapeHtml(r.network)}</td>
+            <td data-label="Reference">${escapeHtml(r.transaction_ref || "—")}</td>
+            <td data-label="Submitted">${timeAgo(r.created_at)}</td>
+            <td data-label="Actions"><div class="action-cell">
+              <button class="btn-small btn-success" onclick="approveRequest('${r.id}', '${r.profile_id}')">Approve</button>
+              <button class="btn-small btn-danger" onclick="rejectRequest('${r.id}')">Reject</button>
+            </div></td>
+          </tr>
+        `).join("")}
+      </tbody>
+    </table>
+  `;
+}
+
+const approveRequest = safeRender(async function (reqId, profileId) {
+  const expires = new Date(); expires.setDate(expires.getDate() + 30);
+  await sb.from("subscription_requests").update({ status: "approved" }).eq("id", reqId);
+  await sb.from("profiles").update({ subscription_status: "active", subscription_expires_at: expires.toISOString() }).eq("id", profileId);
+  await loadAll();
+});
+const rejectRequest = safeRender(async function (reqId) {
+  await sb.from("subscription_requests").update({ status: "rejected" }).eq("id", reqId);
+  await loadAll();
+});
+</script>
+</body>
+</html>
