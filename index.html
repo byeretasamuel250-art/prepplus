@@ -30,17 +30,49 @@ const boot = safeRender(async function () {
   state.profile = data;
   renderSubjectList();
   state.refreshTimer = setInterval(refreshProfile, 15000);
+  startProfileRealtime();
 });
+
+// Applies a freshly-fetched profile row: updates state, and if the
+// subscription just flipped to "active" while the student is sitting
+// on a screen where that matters (subscribe screen, subject list,
+// profile), it re-renders automatically instead of leaving them
+// staring at a stale "waiting for confirmation" message. Mid-quiz is
+// left alone so an approval never interrupts an in-progress attempt.
+function applyProfileUpdate(newProfile) {
+  if (!newProfile || !state.profile) return;
+  const wasActive = state.profile.subscription_status === "active";
+  const nowActive = newProfile.subscription_status === "active";
+  state.profile = newProfile;
+  if (!wasActive && nowActive && !state.quiz) {
+    renderSubjectList();
+  }
+}
 
 async function refreshProfile() {
   if (!state.profile) return;
   const { data } = await sb.from("profiles").select("*").eq("id", state.profile.id).maybeSingle();
-  if (data) state.profile = data;
+  if (data) applyProfileUpdate(data);
+}
+
+// Realtime: hear about an admin's approval within a second or two,
+// rather than waiting up to 15s for the next poll. The 15s poll above
+// stays on as a fallback in case the realtime connection drops.
+let profileChannel = null;
+function startProfileRealtime() {
+  if (profileChannel || !state.profile) return;
+  profileChannel = sb
+    .channel("student-profile-" + state.profile.id)
+    .on("postgres_changes", {
+      event: "UPDATE", schema: "public", table: "profiles", filter: "id=eq." + state.profile.id
+    }, (payload) => applyProfileUpdate(payload.new))
+    .subscribe();
 }
 
 async function logout() {
   clearInterval(state.refreshTimer);
   clearInterval(state.timerInterval);
+  if (profileChannel) { await sb.removeChannel(profileChannel); profileChannel = null; }
   await sb.auth.signOut();
   state = { profile: null, subjects: [], subject: null, topics: [], quiz: null, refreshTimer: null, timerInterval: null };
   await ensureSession(sb);
@@ -104,6 +136,8 @@ const doRegister = safeRender(async function () {
   if (error) { errEl.innerHTML = `<div class="error-banner">${escapeHtml(friendlyError(error))}</div>`; return; }
   state.profile = data;
   renderSubjectList();
+  if (!state.refreshTimer) state.refreshTimer = setInterval(refreshProfile, 15000);
+  startProfileRealtime();
 });
 
 // ---------- LOGIN ----------
@@ -131,6 +165,8 @@ const doLogin = safeRender(async function () {
   if (error) { errEl.innerHTML = `<div class="error-banner">${escapeHtml(friendlyError(error))}</div>`; return; }
   state.profile = data;
   renderSubjectList();
+  if (!state.refreshTimer) state.refreshTimer = setInterval(refreshProfile, 15000);
+  startProfileRealtime();
 });
 
 // ---------- SUBJECT LIST ----------
@@ -171,8 +207,22 @@ async function renderSubjectList() {
 // ---------- SUBSCRIBE ----------
 function renderSubscribe() {
   const p = state.profile;
-  const pendingNote = p.subscription_status === "pending"
-    ? `<div class="error-banner" style="background:var(--yellow-dim);border-color:var(--yellow);color:var(--yellow)">Payment submitted — waiting for confirmation.</div>` : "";
+  const isPending = p.subscription_status === "pending";
+  const pendingNote = isPending
+    ? `<div class="error-banner" style="background:var(--yellow-dim);border-color:var(--yellow);color:var(--yellow)">Payment submitted — waiting for confirmation. This page updates automatically once it's approved.</div>` : "";
+  // Once a request is already pending, hide the "I've paid" form entirely —
+  // there's nothing more for the student to submit, and re-showing the
+  // button invited repeated taps that each created a new request.
+  const confirmCard = isPending ? "" : `
+      <div class="card">
+        <h3>2. Confirm your payment</h3>
+        <label for="s-network">Network used</label>
+        <select id="s-network"><option value="MTN">MTN Mobile Money</option><option value="Airtel">Airtel Money</option></select>
+        <label for="s-ref">Transaction message / reference (optional)</label>
+        <input id="s-ref" type="text" placeholder="Paste the confirmation SMS text or ID">
+        <div id="sub-error"></div>
+        <button class="btn-primary" id="pay-btn" onclick="submitSubscription()">I've paid</button>
+      </div>`;
   root().innerHTML = `
     <div id="subscribe-screen">
       <div class="top-bar"><div class="brand">prep<span class="plus">+</span></div><button class="icon-btn" onclick="renderSubjectList()">← Back</button></div>
@@ -186,24 +236,34 @@ function renderSubscribe() {
         <p style="color:var(--chalk);font-family:var(--font-mono);font-size:15px">Airtel: 0748 237 633</p>
         <p style="font-size:12.5px;margin-top:10px">(Account name: Samuel)</p>
       </div>
-      <div class="card">
-        <h3>2. Confirm your payment</h3>
-        <label for="s-network">Network used</label>
-        <select id="s-network"><option value="MTN">MTN Mobile Money</option><option value="Airtel">Airtel Money</option></select>
-        <label for="s-ref">Transaction message / reference (optional)</label>
-        <input id="s-ref" type="text" placeholder="Paste the confirmation SMS text or ID">
-        <div id="sub-error"></div>
-        <button class="btn-primary" onclick="submitSubscription()">I've paid</button>
-      </div>
+      ${confirmCard}
     </div>
   `;
 }
 
 const submitSubscription = safeRender(async function () {
+  const btn = document.getElementById("pay-btn");
+  // Disable immediately so repeated taps (slow network, impatience,
+  // double-tap) can't fire off multiple inserts before the first
+  // one finishes.
+  if (btn) { btn.disabled = true; btn.textContent = "Submitting…"; }
   const network = document.getElementById("s-network").value;
   const ref = document.getElementById("s-ref").value.trim();
   const { error } = await sb.from("subscription_requests").insert({ profile_id: state.profile.id, network, transaction_ref: ref || null });
-  if (error) { document.getElementById("sub-error").innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`; return; }
+  if (error) {
+    // A duplicate pending request is expected and harmless — the DB
+    // itself blocked it (see idx_one_pending_request_per_profile).
+    // Treat it as success rather than showing a scary raw error.
+    if (error.code === "23505") {
+      const { data } = await sb.from("profiles").select("*").eq("id", state.profile.id).maybeSingle();
+      if (data) state.profile = data;
+      renderSubscribe();
+      return;
+    }
+    document.getElementById("sub-error").innerHTML = `<div class="error-banner">${escapeHtml(error.message)}</div>`;
+    if (btn) { btn.disabled = false; btn.textContent = "I've paid"; }
+    return;
+  }
   const { data } = await sb.from("profiles").update({ subscription_status: "pending" }).eq("id", state.profile.id).select().maybeSingle();
   if (data) state.profile = data;
   renderSubscribe();
