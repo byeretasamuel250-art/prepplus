@@ -70,7 +70,7 @@ function startRequestsRealtime() {
   if (requestsChannel) return; // already listening
   requestsChannel = sb
     .channel("admin-subscription-requests")
-    .on("postgres_changes", { event: "*", schema: "public", table: "subscription_requests" }, async () => {
+    .on("postgres_changes", { event: "*", schema: "public", table: "subscription_requests" }, async (payload) => {
       // Refetch just the pending requests + stats. Avoid a full loadAll()
       // while the admin is mid-typing on the Content or Users tab.
       const { data: requests } = await sb.from("subscription_requests")
@@ -78,9 +78,57 @@ function startRequestsRealtime() {
       state.requests = requests || [];
       renderStats();
       if (state.tab === "requests") renderRequestsTable();
+      // Only alert on a genuinely new "I've paid" tap — not when this
+      // same event fires because a request was just approved/rejected.
+      if (payload.eventType === "INSERT" && payload.new?.status === "pending") {
+        playAlertSound();
+        flashTabTitle();
+      }
     })
     .subscribe();
 }
+
+// Short two-tone beep via the Web Audio API — no external sound file
+// to host or go missing. Browsers block audio until the page has had
+// some user interaction; logging in counts, so this plays fine once
+// the admin is on the dashboard.
+function playAlertSound() {
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    [880, 1175].forEach((freq, i) => {
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      osc.type = "sine";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.001, ctx.currentTime);
+      gain.gain.linearRampToValueAtTime(0.2, ctx.currentTime + i * 0.15 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + i * 0.15 + 0.28);
+      osc.connect(gain).connect(ctx.destination);
+      osc.start(ctx.currentTime + i * 0.15);
+      osc.stop(ctx.currentTime + i * 0.15 + 0.3);
+    });
+  } catch (e) {
+    console.warn("Couldn't play alert sound:", e);
+  }
+}
+
+const originalTitle = document.title;
+let titleFlashInterval = null;
+function flashTabTitle() {
+  if (titleFlashInterval) return; // already flashing
+  let toggle = false;
+  titleFlashInterval = setInterval(() => {
+    document.title = toggle ? originalTitle : "🔔 New payment request";
+    toggle = !toggle;
+  }, 1000);
+}
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && titleFlashInterval) {
+    clearInterval(titleFlashInterval);
+    titleFlashInterval = null;
+    document.title = originalTitle;
+  }
+});
 
 async function adminLogout() {
   if (requestsChannel) { await sb.removeChannel(requestsChannel); requestsChannel = null; }
