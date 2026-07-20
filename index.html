@@ -176,7 +176,7 @@ async function renderSubjectList() {
   root().innerHTML = `
     <div class="top-bar">
       <div class="brand">prep<span class="plus">+</span></div>
-      <div>
+      <div class="top-bar-actions">
         <button class="icon-btn" onclick="renderProfile()">Profile</button>
         <button class="icon-btn" onclick="logout()">Log out</button>
       </div>
@@ -200,6 +200,7 @@ async function renderSubjectList() {
           <div class="subject-meta">${s.level}</div>
         </div>
         ${s.is_free ? `<span class="badge badge-free">Free</span>` : ""}
+        ${!locked ? `<span class="subject-chevron">›</span>` : ""}
       </div>`;
   }).join("");
 }
@@ -306,10 +307,10 @@ async function openSubject(subjectId) {
     <h2>${escapeHtml(subject.name)}</h2>
     <p>${subject.level}</p>
     <div class="mode-grid">
-      <div class="mode-card" onclick="showTopics()"><div class="mtitle">Practice by topic</div><div class="msub">Focus on one area</div></div>
-      <div class="mode-card" onclick="showPapers()"><div class="mtitle">Full past paper</div><div class="msub">By year</div></div>
-      <div class="mode-card" onclick="startTimedExam()"><div class="mtitle">Timed exam</div><div class="msub">30 min, exam pressure</div></div>
-      <div class="mode-card" onclick="showPaperFiles()"><div class="mtitle">Past papers library</div><div class="msub">Scanned originals</div></div>
+      <div class="mode-card" onclick="showTopics()"><div class="micon">🎯</div><div class="mtitle">Practice by topic</div><div class="msub">Focus on one area</div></div>
+      <div class="mode-card" onclick="showPapers()"><div class="micon">📄</div><div class="mtitle">Full past paper</div><div class="msub">By year</div></div>
+      <div class="mode-card" onclick="startTimedExam()"><div class="micon">⏱️</div><div class="mtitle">Timed exam</div><div class="msub">30 min, exam pressure</div></div>
+      <div class="mode-card" onclick="showPaperFiles()"><div class="micon">📚</div><div class="mtitle">Past papers library</div><div class="msub">Scanned originals</div></div>
     </div>
     <div id="mode-detail"></div>
   `;
