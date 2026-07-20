@@ -103,6 +103,14 @@ create table if not exists paper_files (
 );
 create index if not exists idx_paper_files_subject on paper_files(subject_id);
 
+-- Prevent a student from ever having more than one pending payment
+-- request at a time. This is a hard database guard, so it holds even
+-- if someone taps "I've paid" many times fast, has two tabs open, or
+-- retries after a network blip — the DB itself rejects the duplicate.
+create unique index if not exists idx_one_pending_request_per_profile
+  on subscription_requests (profile_id)
+  where (status = 'pending');
+
 -- storage bucket for uploaded scanned papers — NOT public; access is
 -- controlled entirely by the RLS policies below (same subscription
 -- gate as the questions table), so a locked subject's papers are
@@ -356,3 +364,12 @@ create policy "answers_select_own_or_admin" on attempt_answers for select
   );
 
 -- admin_allowlist: no direct client access; only is_admin() reads it (bypasses RLS via security definer)
+
+-- ============================================================
+-- Realtime: let the admin dashboard and the student app hear
+-- about changes instantly instead of needing a manual refresh.
+-- (If this errors saying the table is already a member, that's
+-- fine — it just means it's already on; ignore that error.)
+-- ============================================================
+alter publication supabase_realtime add table subscription_requests;
+alter publication supabase_realtime add table profiles;
